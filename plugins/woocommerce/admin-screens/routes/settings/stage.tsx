@@ -8,13 +8,14 @@ import { store as coreStore, useEntityRecord } from '@wordpress/core-data';
 import { useSelect } from '@wordpress/data';
 import { store as editorStore } from '@wordpress/editor';
 import { DataForm, useFormValidity } from '@wordpress/dataviews';
-import type { Form } from '@wordpress/dataviews';
+import type { Field, Form } from '@wordpress/dataviews';
 import { __ } from '@wordpress/i18n';
-import { useParams } from '@wordpress/route';
+import { useNavigate, useParams } from '@wordpress/route';
 // eslint-disable-next-line @wordpress/use-recommended-components -- Fine on this experimental screen until the repo enables allowUseWithCaution.
 import { Button, Notice, Stack } from '@wordpress/ui';
 import { useViewConfig } from '@wordpress/views';
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { MouseEvent } from 'react';
 
 /**
  * Internal dependencies
@@ -23,6 +24,7 @@ import type { SettingsRecord } from '../../entity-fields/types';
 import { getSection } from './entities';
 import type { SettingsEntityConfig, SettingsSection } from './entities';
 import { getEntityFields } from './entity-fields';
+import { resolveLocation, subPageFieldId } from './location';
 import './style.scss';
 
 const EMPTY_FORM: Form = { fields: [] };
@@ -41,25 +43,68 @@ function getErrorMessage( error: unknown, fallback: string ): string {
 }
 
 /**
+ * Router path to a settings page, or to a sub-page within it.
+ */
+const pagePath = ( section: string, page: string, ...subPages: string[] ) =>
+	[ '/settings', section, page, ...subPages ].join( '/' );
+
+/**
+ * Get the router path of a link to this settings page or one of its sub-pages, such as a breadcrumb.
+ */
+function getPageLinkPath( event: MouseEvent, basePath: string ) {
+	const anchor = ( event.target as Element ).closest( 'a[href]' );
+	if (
+		! anchor ||
+		event.button !== 0 ||
+		event.metaKey ||
+		event.ctrlKey ||
+		event.shiftKey ||
+		event.altKey
+	) {
+		return undefined;
+	}
+	const url = new URL( ( anchor as HTMLAnchorElement ).href );
+	const current = new URL( window.location.href );
+	const [ path = '' ] = ( url.searchParams.get( 'p' ) ?? '' ).split( '?' );
+	return url.origin === current.origin &&
+		url.pathname === current.pathname &&
+		url.searchParams.get( 'page' ) === current.searchParams.get( 'page' ) &&
+		( path === basePath || path.startsWith( `${ basePath }/` ) )
+		? path
+		: undefined;
+}
+
+/**
  * Render and save one settings entity using WordPress entity and form APIs.
  */
 function SettingsForm( {
 	section,
 	config,
+	subPath,
 }: {
 	section: SettingsSection;
 	config: SettingsEntityConfig;
+	subPath: string;
 } ) {
 	const { kind, name, label } = config;
 	const { record, editedRecord, hasEdits, edit, save } =
 		useEntityRecord< SettingsRecord >( kind, name, name );
 	const isNarrow = useViewportMatch( 'medium', '<' );
 	const { form } = useViewConfig( { kind, name } );
+	const location = useMemo(
+		() => ( form ? resolveLocation( form, subPath ) : undefined ),
+		[ form, subPath ]
+	);
+	const navigate = useNavigate();
 	const [ notice, setNotice ] = useState< {
 		status: 'success' | 'error';
 		message: string;
 	} >();
-	const { fields, isSaving, loadError } = useSelect(
+	const {
+		fields: entityFields,
+		isSaving,
+		loadError,
+	} = useSelect(
 		( select ) => {
 			const core = select( coreStore );
 			return {
@@ -74,11 +119,81 @@ function SettingsForm( {
 		},
 		[ kind, name ]
 	);
+	const discard = () => {
+		if ( record ) {
+			edit( record );
+			setNotice( undefined );
+		}
+	};
+	// Each page is its own form, so its unsaved edits go when the merchant leaves it, including through the browser history.
+	const discardRef = useRef( discard );
+	discardRef.current = discard;
+	useEffect(
+		() => () => {
+			discardRef.current();
+		},
+		[]
+	);
+	// Start each page at the top, rather than where the last one was scrolled to.
+	useEffect( () => {
+		window.scrollTo( 0, 0 );
+	}, [] );
+
+	const basePath = pagePath( section.slug, name );
+	const trail = location?.subPages ?? [];
+	const currentPath = pagePath(
+		section.slug,
+		name,
+		...trail.map( ( group ) => group.id )
+	);
+	const goTo = ( to: string ) => {
+		if (
+			hasEdits &&
+			// eslint-disable-next-line no-alert -- A blocking prompt keeps the edits until the merchant decides.
+			! window.confirm(
+				__(
+					'You have unsaved changes on this page. If you leave, they will be lost.',
+					'woocommerce'
+				)
+			)
+		) {
+			return;
+		}
+		void navigate( { to } );
+	};
+	// The link fields are memoized, so they call the latest `goTo` to see the current unsaved edits.
+	const goToRef = useRef( goTo );
+	goToRef.current = goTo;
+	const fields = useMemo( () => {
+		const links = ( location?.subPageLinks ?? [] ).map(
+			( link ): Field< SettingsRecord > => ( {
+				id: subPageFieldId( link.id ),
+				label: link.label,
+				Edit: () => (
+					<div>
+						<Button
+							variant="outline"
+							size="compact"
+							onClick={ () => {
+								goToRef.current(
+									`${ currentPath }/${ link.id }`
+								);
+							} }
+						>
+							{ link.label }
+						</Button>
+					</div>
+				),
+			} )
+		);
+		return [ ...entityFields, ...links ];
+	}, [ entityFields, location, currentPath ] );
+
 	const data = editedRecord as SettingsRecord | undefined;
 	const { validity, isValid } = useFormValidity(
 		data ?? {},
 		fields,
-		form ?? EMPTY_FORM
+		location?.form ?? EMPTY_FORM
 	);
 	const saveSettings = async () => {
 		if ( isSaving || ! hasEdits || ! isValid ) {
@@ -102,7 +217,8 @@ function SettingsForm( {
 		}
 	};
 	const hasLoadError = !! loadError;
-	const isReady = ! hasLoadError && !! data && !! form;
+	const isReady = ! hasLoadError && !! data && !! location;
+	const isMissing = ! hasLoadError && !! data && !! form && ! location;
 	// Breadcrumbs link through the router, which only leaves the screen for an absolute URL.
 	const sectionUrl = new URL( section.url, window.location.href ).toString();
 	const formActions = (
@@ -111,12 +227,7 @@ function SettingsForm( {
 				variant="outline"
 				size="compact"
 				disabled={ isSaving || ! hasEdits }
-				onClick={ () => {
-					if ( record ) {
-						edit( record );
-						setNotice( undefined );
-					}
-				} }
+				onClick={ discard }
 			>
 				{ __( 'Discard changes', 'woocommerce' ) }
 			</Button>
@@ -131,80 +242,126 @@ function SettingsForm( {
 			</Button>
 		</Stack>
 	);
+	// Each sub-page crumb links to its own path, so a nested sub-page can go back one level.
+	const subPageCrumbs = trail.map( ( group, index ) => {
+		const crumbLabel = group.label ?? group.id;
+		if ( index === trail.length - 1 ) {
+			return { label: crumbLabel };
+		}
+		const ids = trail.slice( 0, index + 1 ).map( ( item ) => item.id );
+		return {
+			label: crumbLabel,
+			to: pagePath( section.slug, name, ...ids ),
+		};
+	} );
 	return (
-		<Page
-			ariaLabel={ label }
-			breadcrumbs={
-				<Breadcrumbs
-					items={ [
-						{ label: section.label, to: sectionUrl },
-						{ label },
-					] }
-				/>
-			}
-			showSidebarToggle={ false }
-			hasPadding
-			// The Page header doesn't wrap its actions, so they move below the form on small screens.
-			actions={ isReady && ! isNarrow ? formActions : undefined }
+		// Links to this page's own sub-pages, such as breadcrumbs, ask before discarding unsaved edits.
+		<div
+			onClickCapture={ ( event ) => {
+				const linkPath = getPageLinkPath( event, basePath );
+				if ( linkPath ) {
+					event.preventDefault();
+					event.stopPropagation();
+					goTo( linkPath );
+				}
+			} }
 		>
-			<Stack
-				direction="column"
-				gap="lg"
-				className="woocommerce-settings__content"
+			<Page
+				ariaLabel={ label }
+				breadcrumbs={
+					<Breadcrumbs
+						items={ [
+							{ label: section.label, to: sectionUrl },
+							trail.length || isMissing
+								? { label, to: basePath }
+								: { label },
+							...subPageCrumbs,
+						] }
+					/>
+				}
+				showSidebarToggle={ false }
+				hasPadding
+				// The Page header doesn't wrap its actions, so they move below the form on small screens.
+				actions={ isReady && ! isNarrow ? formActions : undefined }
 			>
-				{ hasLoadError && (
-					<Notice.Root intent="error">
-						<Notice.Description>
-							{ getErrorMessage(
-								loadError,
-								__( 'Unable to load settings.', 'woocommerce' )
-							) }
-						</Notice.Description>
-					</Notice.Root>
-				) }
-				{ ! hasLoadError && ! isReady && (
-					<Stack direction="row" justify="center">
-						<Spinner />
-					</Stack>
-				) }
-				{ notice && (
-					<Notice.Root intent={ notice.status }>
-						<Notice.Description>
-							{ notice.message }
-						</Notice.Description>
-						<Notice.CloseIcon
-							onClick={ () => {
-								setNotice( undefined );
+				<Stack
+					direction="column"
+					gap="lg"
+					className="woocommerce-settings__content"
+				>
+					{ hasLoadError && (
+						<Notice.Root intent="error">
+							<Notice.Description>
+								{ getErrorMessage(
+									loadError,
+									__(
+										'Unable to load settings.',
+										'woocommerce'
+									)
+								) }
+							</Notice.Description>
+						</Notice.Root>
+					) }
+					{ isMissing && (
+						<Notice.Root intent="error">
+							<Notice.Description>
+								{ __(
+									'This settings page doesn’t exist.',
+									'woocommerce'
+								) }
+							</Notice.Description>
+						</Notice.Root>
+					) }
+					{ ! hasLoadError && ! isReady && ! isMissing && (
+						<Stack direction="row" justify="center">
+							<Spinner />
+						</Stack>
+					) }
+					{ notice && (
+						<Notice.Root intent={ notice.status }>
+							<Notice.Description>
+								{ notice.message }
+							</Notice.Description>
+							<Notice.CloseIcon
+								onClick={ () => {
+									setNotice( undefined );
+								} }
+							/>
+						</Notice.Root>
+					) }
+					{ isReady && (
+						<DataForm
+							data={ data }
+							fields={ fields }
+							form={ location.form }
+							validity={ validity }
+							onChange={ ( edits ) => {
+								if ( ! isSaving ) {
+									setNotice( undefined );
+									edit( edits );
+								}
 							} }
 						/>
-					</Notice.Root>
-				) }
-				{ isReady && (
-					<DataForm
-						data={ data }
-						fields={ fields }
-						form={ form }
-						validity={ validity }
-						onChange={ ( edits ) => {
-							if ( ! isSaving ) {
-								setNotice( undefined );
-								edit( edits );
-							}
-						} }
-					/>
-				) }
-				{ isReady && isNarrow && formActions }
-			</Stack>
-		</Page>
+					) }
+					{ isReady && isNarrow && formActions }
+				</Stack>
+			</Page>
+		</div>
 	);
 }
 
 /**
- * Show the settings entity whose name matches the route, from the entity kind of the route's area.
+ * Show the settings entity whose name matches the route, from the entity kind of the route's area,
+ * on the sub-page the rest of the path names.
  */
 function SettingsStage() {
-	const { section: slug, page }: { section?: string; page?: string } =
-		useParams( { strict: false } );
+	const {
+		section: slug,
+		page,
+		_splat: subPath = '',
+	}: { section?: string; page?: string; _splat?: string } = useParams( {
+		strict: false,
+	} );
 	const section = getSection( slug );
 	const kind = section?.kind;
 	const config = useSelect(
@@ -216,10 +373,12 @@ function SettingsStage() {
 		[ kind, page ]
 	);
 	return section && config ? (
+		// Each page is its own form, so it starts with its own edits and notice.
 		<SettingsForm
-			key={ config.name }
+			key={ `${ config.name }/${ subPath }` }
 			section={ section }
 			config={ config }
+			subPath={ subPath }
 		/>
 	) : null;
 }
